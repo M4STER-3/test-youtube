@@ -338,6 +338,7 @@
         config.playerVars.listType = "playlist";
         config.playerVars.list = playlistId;
         config.playerVars.index = playlistPosition;
+        if (videoId) config.videoId = videoId;
       } else {
         config.videoId = videoId;
       }
