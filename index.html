@@ -66,13 +66,14 @@
     let playlistId = playlistIdPattern.test(rawPlaylistId) ? rawPlaylistId : "";
     let videoId = videoIdPattern.test(rawVideoId) ? rawVideoId : "";
     let mediaType = playlistId ? "playlist" : (videoId ? "video" : "");
+    const initialPlaylistIndex = Math.max(0, Number.parseInt(params.get("index") || "0", 10) || 0);
     const playerContainer = document.getElementById("player");
 
     let player = null;
     let playerReady = false;
     let loopEnabled = false;
     let shuffleEnabled = false;
-    let playlistPosition = 0;
+    let playlistPosition = initialPlaylistIndex;
     let parentOrigin = "*";
     let lastVolumeSignature = "";
     const pendingCommands = [];
@@ -232,6 +233,22 @@
             player.previousVideo?.();
           }
           break;
+        case "first": {
+          if (mediaType !== "playlist" || !playlistId) break;
+          playlistPosition = 0;
+          const playlist = player.getPlaylist?.();
+          if (Array.isArray(playlist) && playlist.length) {
+            player.playVideoAt?.(0);
+          } else {
+            player.loadPlaylist?.({
+              listType: "playlist",
+              list: playlistId,
+              index: 0,
+              startSeconds: 0,
+            });
+          }
+          break;
+        }
         case "restart":
           player.seekTo?.(0, true);
           player.playVideo?.();
@@ -320,7 +337,7 @@
       if (mediaType === "playlist") {
         config.playerVars.listType = "playlist";
         config.playerVars.list = playlistId;
-        config.playerVars.index = 0;
+        config.playerVars.index = playlistPosition;
       } else {
         config.videoId = videoId;
       }
