@@ -99,6 +99,18 @@
       }, parentOrigin);
     }
 
+    function getCurrentVideoId() {
+      const videoDataId = String(player?.getVideoData?.()?.video_id || "");
+      if (videoIdPattern.test(videoDataId)) return videoDataId;
+      try {
+        const playerUrl = new URL(String(player?.getVideoUrl?.() || ""));
+        const urlId = String(playerUrl.searchParams.get("v") || "");
+        return videoIdPattern.test(urlId) ? urlId : "";
+      } catch {
+        return "";
+      }
+    }
+
     function getPlayerSnapshot() {
       if (!playerReady || !player) return {};
       const videoData = player.getVideoData?.() || {};
@@ -114,7 +126,7 @@
         playlistIndex: playlistPosition,
         playlistLength: Array.isArray(playlist) ? playlist.length : 0,
         playlist: Array.isArray(playlist) ? playlist : [],
-        currentVideoId: videoData.video_id || "",
+        currentVideoId: getCurrentVideoId(),
         title: videoData.title || "",
         author: videoData.author || "",
       };
