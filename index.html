@@ -55,48 +55,199 @@
   <div id="player"></div>
 
   <script>
+    "use strict";
+
+    const BRIDGE_CHANNEL = "focus-hub-youtube";
     const params = new URLSearchParams(window.location.search);
-
-    const playlistId = params.get("playlist");
-    const videoId = params.get("video");
-
+    const rawPlaylistId = params.get("playlist") || "";
+    const rawVideoId = params.get("video") || "";
+    const playlistIdPattern = /^[A-Za-z0-9_-]{6,120}$/;
+    const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
+    const playlistId = playlistIdPattern.test(rawPlaylistId) ? rawPlaylistId : "";
+    const videoId = videoIdPattern.test(rawVideoId) ? rawVideoId : "";
+    const mediaType = playlistId ? "playlist" : (videoId ? "video" : "");
     const playerContainer = document.getElementById("player");
 
-    const playlistIdPattern = /^[A-Za-z0-9_-]{10,80}$/;
-    const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
+    let player = null;
+    let playerReady = false;
+    let loopEnabled = false;
+    let parentOrigin = "*";
+    let lastVolumeSignature = "";
+    const pendingCommands = [];
 
-    let embedUrl = "";
-
-    if (playlistId && playlistIdPattern.test(playlistId)) {
-      embedUrl =
-        "https://www.youtube.com/embed/videoseries?list=" +
-        encodeURIComponent(playlistId);
-    } else if (videoId && videoIdPattern.test(videoId)) {
-      embedUrl =
-        "https://www.youtube.com/embed/" +
-        encodeURIComponent(videoId);
+    try {
+      const referrerOrigin = document.referrer ? new URL(document.referrer).origin : "";
+      if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(referrerOrigin)) {
+        parentOrigin = referrerOrigin;
+      }
+    } catch {
+      parentOrigin = "*";
     }
 
-    if (!embedUrl) {
-      playerContainer.innerHTML = `
-        <div class="message">
-          Aucune vidéo ou playlist valide n’a été fournie.
-        </div>
-      `;
+    function postBridgeEvent(event, data = {}) {
+      if (window.parent === window) return;
+      window.parent.postMessage({
+        channel: BRIDGE_CHANNEL,
+        kind: "event",
+        event,
+        mediaType,
+        videoId,
+        playlistId,
+        data,
+      }, parentOrigin);
+    }
+
+    function getPlayerSnapshot() {
+      if (!playerReady || !player) return {};
+      const videoData = player.getVideoData?.() || {};
+      const playlist = player.getPlaylist?.();
+      return {
+        state: player.getPlayerState?.(),
+        volume: player.getVolume?.(),
+        muted: !!player.isMuted?.(),
+        playlistIndex: player.getPlaylistIndex?.(),
+        playlistLength: Array.isArray(playlist) ? playlist.length : 0,
+        playlist: Array.isArray(playlist) ? playlist : [],
+        currentVideoId: videoData.video_id || "",
+        title: videoData.title || "",
+        author: videoData.author || "",
+      };
+    }
+
+    function publishState(event = "state") {
+      postBridgeEvent(event, getPlayerSnapshot());
+    }
+
+    function executeCommand(message) {
+      if (!playerReady || !player) {
+        pendingCommands.push(message);
+        return;
+      }
+      const command = String(message.command || "");
+      const value = message.value;
+      switch (command) {
+        case "play":
+          player.playVideo?.();
+          break;
+        case "pause":
+          player.pauseVideo?.();
+          break;
+        case "toggle":
+          if (player.getPlayerState?.() === 1) player.pauseVideo?.();
+          else player.playVideo?.();
+          break;
+        case "next":
+          player.nextVideo?.();
+          break;
+        case "previous":
+          player.previousVideo?.();
+          break;
+        case "restart":
+          player.seekTo?.(0, true);
+          player.playVideo?.();
+          break;
+        case "setVolume":
+          player.setVolume?.(Math.max(0, Math.min(100, Number(value) || 0)));
+          break;
+        case "setMuted":
+          if (value) player.mute?.();
+          else player.unMute?.();
+          break;
+        case "setLoop":
+          loopEnabled = !!value;
+          if (mediaType === "playlist") player.setLoop?.(loopEnabled);
+          break;
+        case "setShuffle":
+          if (mediaType === "playlist") player.setShuffle?.(!!value);
+          break;
+        case "getState":
+          publishState("snapshot");
+          return;
+        default:
+          return;
+      }
+      window.setTimeout(() => publishState("snapshot"), 80);
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.source !== window.parent) return;
+      const message = event.data;
+      if (!message || message.channel !== BRIDGE_CHANNEL || message.kind !== "command") return;
+      if (parentOrigin !== "*" && event.origin !== parentOrigin) return;
+      if (parentOrigin === "*" && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(event.origin)) {
+        parentOrigin = event.origin;
+      }
+      executeCommand(message);
+    });
+
+    function onPlayerReady() {
+      playerReady = true;
+      const iframe = player.getIframe?.();
+      if (iframe) {
+        iframe.referrerPolicy = "strict-origin-when-cross-origin";
+        iframe.setAttribute("allow", "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share");
+      }
+      postBridgeEvent("ready", getPlayerSnapshot());
+      while (pendingCommands.length) executeCommand(pendingCommands.shift());
+    }
+
+    function onPlayerStateChange(event) {
+      if (event.data === 0 && mediaType === "video" && loopEnabled) {
+        player.seekTo?.(0, true);
+        player.playVideo?.();
+      }
+      publishState("state");
+    }
+
+    function onPlayerError(event) {
+      postBridgeEvent("error", {
+        ...getPlayerSnapshot(),
+        code: Number(event.data) || 0,
+      });
+    }
+
+    window.onYouTubeIframeAPIReady = function () {
+      const config = {
+        width: "100%",
+        height: "100%",
+        playerVars: {
+          playsinline: 1,
+          rel: 0,
+          controls: 1,
+          enablejsapi: 1,
+        },
+        events: {
+          onReady: onPlayerReady,
+          onStateChange: onPlayerStateChange,
+          onError: onPlayerError,
+        },
+      };
+      if (mediaType === "playlist") {
+        config.playerVars.listType = "playlist";
+        config.playerVars.list = playlistId;
+        config.playerVars.index = 0;
+      } else {
+        config.videoId = videoId;
+      }
+      player = new YT.Player("player", config);
+    };
+
+    if (!mediaType) {
+      playerContainer.innerHTML = '<div class="message">Aucune vidéo ou playlist valide n’a été fournie.</div>';
+      postBridgeEvent("error", { code: 2, message: "Identifiant YouTube invalide" });
     } else {
-      const iframe = document.createElement("iframe");
-
-      iframe.src = embedUrl;
-      iframe.title = "Lecteur YouTube";
-      iframe.referrerPolicy = "strict-origin-when-cross-origin";
-
-      iframe.allow =
-        "accelerometer; autoplay; clipboard-write; encrypted-media; " +
-        "gyroscope; picture-in-picture; web-share";
-
-      iframe.allowFullscreen = true;
-
-      playerContainer.appendChild(iframe);
+      const script = document.createElement("script");
+      script.src = "https://www.youtube.com/iframe_api";
+      script.referrerPolicy = "strict-origin-when-cross-origin";
+      script.onerror = () => postBridgeEvent("error", { code: 5, message: "API YouTube inaccessible" });
+      document.head.appendChild(script);
+      window.setInterval(() => {
+        if (!playerReady || !player) return;
+        const signature = `${player.getVolume?.()}-${!!player.isMuted?.()}`;
+        if (signature === lastVolumeSignature) return;
+        lastVolumeSignature = signature;
+        publishState("volume");
+      }, 500);
     }
   </script>
 </body>
