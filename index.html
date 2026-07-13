@@ -63,9 +63,9 @@
     const rawVideoId = params.get("video") || "";
     const playlistIdPattern = /^[A-Za-z0-9_-]{6,120}$/;
     const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
-    const playlistId = playlistIdPattern.test(rawPlaylistId) ? rawPlaylistId : "";
-    const videoId = videoIdPattern.test(rawVideoId) ? rawVideoId : "";
-    const mediaType = playlistId ? "playlist" : (videoId ? "video" : "");
+    let playlistId = playlistIdPattern.test(rawPlaylistId) ? rawPlaylistId : "";
+    let videoId = videoIdPattern.test(rawVideoId) ? rawVideoId : "";
+    let mediaType = playlistId ? "playlist" : (videoId ? "video" : "");
     const playerContainer = document.getElementById("player");
 
     let player = null;
@@ -126,6 +126,39 @@
       const command = String(message.command || "");
       const value = message.value;
       switch (command) {
+        case "loadMedia": {
+          const nextType = value?.type === "playlist" ? "playlist" : "video";
+          const nextPlaylistId = playlistIdPattern.test(String(value?.playlistId || ""))
+            ? String(value.playlistId)
+            : "";
+          const nextVideoId = videoIdPattern.test(String(value?.videoId || ""))
+            ? String(value.videoId)
+            : "";
+          const autoplay = value?.autoplay !== false;
+          if (nextType === "playlist" && nextPlaylistId) {
+            mediaType = "playlist";
+            playlistId = nextPlaylistId;
+            videoId = "";
+            const playlistCommand = {
+              listType: "playlist",
+              list: playlistId,
+              index: Math.max(0, Number(value?.index) || 0),
+              startSeconds: 0,
+            };
+            if (autoplay) player.loadPlaylist?.(playlistCommand);
+            else player.cuePlaylist?.(playlistCommand);
+          } else if (nextVideoId) {
+            mediaType = "video";
+            videoId = nextVideoId;
+            playlistId = "";
+            if (autoplay) player.loadVideoById?.(videoId);
+            else player.cueVideoById?.(videoId);
+          } else {
+            postBridgeEvent("error", { code: 2, message: "Identifiant YouTube invalide" });
+            return;
+          }
+          break;
+        }
         case "play":
           player.playVideo?.();
           break;
