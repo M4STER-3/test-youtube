@@ -71,6 +71,8 @@
     let player = null;
     let playerReady = false;
     let loopEnabled = false;
+    let shuffleEnabled = false;
+    let playlistPosition = 0;
     let parentOrigin = "*";
     let lastVolumeSignature = "";
     const pendingCommands = [];
@@ -101,11 +103,15 @@
       if (!playerReady || !player) return {};
       const videoData = player.getVideoData?.() || {};
       const playlist = player.getPlaylist?.();
+      const reportedPlaylistIndex = Number(player.getPlaylistIndex?.());
+      if (Number.isFinite(reportedPlaylistIndex) && reportedPlaylistIndex >= 0) {
+        playlistPosition = reportedPlaylistIndex;
+      }
       return {
         state: player.getPlayerState?.(),
         volume: player.getVolume?.(),
         muted: !!player.isMuted?.(),
-        playlistIndex: player.getPlaylistIndex?.(),
+        playlistIndex: playlistPosition,
         playlistLength: Array.isArray(playlist) ? playlist.length : 0,
         playlist: Array.isArray(playlist) ? playlist : [],
         currentVideoId: videoData.video_id || "",
@@ -139,10 +145,11 @@
             mediaType = "playlist";
             playlistId = nextPlaylistId;
             videoId = "";
+            playlistPosition = Math.max(0, Number(value?.index) || 0);
             const playlistCommand = {
               listType: "playlist",
               list: playlistId,
-              index: Math.max(0, Number(value?.index) || 0),
+              index: playlistPosition,
               startSeconds: 0,
             };
             if (autoplay) player.loadPlaylist?.(playlistCommand);
@@ -170,10 +177,48 @@
           else player.playVideo?.();
           break;
         case "next":
-          player.nextVideo?.();
+          if (mediaType === "playlist") {
+            const playlist = player.getPlaylist?.();
+            if (shuffleEnabled && Array.isArray(playlist) && playlist.length) {
+              player.nextVideo?.();
+            } else {
+              playlistPosition += 1;
+              if (Array.isArray(playlist) && playlist.length) {
+                player.playVideoAt?.(playlistPosition % playlist.length);
+              } else {
+                player.loadPlaylist?.({
+                  listType: "playlist",
+                  list: playlistId,
+                  index: playlistPosition,
+                  startSeconds: 0,
+                });
+              }
+            }
+          } else {
+            player.nextVideo?.();
+          }
           break;
         case "previous":
-          player.previousVideo?.();
+          if (mediaType === "playlist") {
+            const playlist = player.getPlaylist?.();
+            if (shuffleEnabled && Array.isArray(playlist) && playlist.length) {
+              player.previousVideo?.();
+            } else {
+              playlistPosition = Math.max(0, playlistPosition - 1);
+              if (Array.isArray(playlist) && playlist.length) {
+                player.playVideoAt?.(playlistPosition % playlist.length);
+              } else {
+                player.loadPlaylist?.({
+                  listType: "playlist",
+                  list: playlistId,
+                  index: playlistPosition,
+                  startSeconds: 0,
+                });
+              }
+            }
+          } else {
+            player.previousVideo?.();
+          }
           break;
         case "restart":
           player.seekTo?.(0, true);
@@ -191,7 +236,8 @@
           if (mediaType === "playlist") player.setLoop?.(loopEnabled);
           break;
         case "setShuffle":
-          if (mediaType === "playlist") player.setShuffle?.(!!value);
+          shuffleEnabled = !!value;
+          if (mediaType === "playlist") player.setShuffle?.(shuffleEnabled);
           break;
         case "getState":
           publishState("snapshot");
@@ -225,6 +271,10 @@
     }
 
     function onPlayerStateChange(event) {
+      const reportedPlaylistIndex = Number(player?.getPlaylistIndex?.());
+      if (mediaType === "playlist" && Number.isFinite(reportedPlaylistIndex) && reportedPlaylistIndex >= 0) {
+        playlistPosition = reportedPlaylistIndex;
+      }
       if (event.data === 0 && mediaType === "video" && loopEnabled) {
         player.seekTo?.(0, true);
         player.playVideo?.();
