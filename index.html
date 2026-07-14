@@ -153,20 +153,29 @@
           const nextVideoId = videoIdPattern.test(String(value?.videoId || ""))
             ? String(value.videoId)
             : "";
+          const nextPlaylistIds = Array.isArray(value?.playlistIds)
+            ? value.playlistIds.map((id) => String(id || "")).filter((id) => videoIdPattern.test(id)).slice(0, 1000)
+            : [];
           const autoplay = value?.autoplay !== false;
           if (nextType === "playlist" && nextPlaylistId) {
             mediaType = "playlist";
             playlistId = nextPlaylistId;
             videoId = "";
             playlistPosition = Math.max(0, Number(value?.index) || 0);
-            const playlistCommand = {
-              listType: "playlist",
-              list: playlistId,
-              index: playlistPosition,
-              startSeconds: 0,
-            };
-            if (autoplay) player.loadPlaylist?.(playlistCommand);
-            else player.cuePlaylist?.(playlistCommand);
+            if (nextPlaylistIds.length) {
+              playlistPosition = Math.min(playlistPosition, nextPlaylistIds.length - 1);
+              if (autoplay) player.loadPlaylist?.(nextPlaylistIds, playlistPosition, 0);
+              else player.cuePlaylist?.(nextPlaylistIds, playlistPosition, 0);
+            } else {
+              const playlistCommand = {
+                listType: "playlist",
+                list: playlistId,
+                index: playlistPosition,
+                startSeconds: 0,
+              };
+              if (autoplay) player.loadPlaylist?.(playlistCommand);
+              else player.cuePlaylist?.(playlistCommand);
+            }
           } else if (nextVideoId) {
             mediaType = "video";
             videoId = nextVideoId;
