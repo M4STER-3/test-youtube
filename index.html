@@ -76,6 +76,8 @@
     let playlistPosition = initialPlaylistIndex;
     let parentOrigin = "*";
     let lastVolumeSignature = "";
+    let playerResizeFrame = 0;
+    let lastPlayerSize = "";
     const pendingCommands = [];
 
     try {
@@ -135,6 +137,35 @@
 
     function publishState(event = "state") {
       postBridgeEvent(event, getPlayerSnapshot());
+    }
+
+    function resizePlayer(requestedSize = null) {
+      if (!playerReady || !player?.setSize) return false;
+      const requestedWidth = Number(requestedSize?.width);
+      const requestedHeight = Number(requestedSize?.height);
+      const width = Math.max(1, Math.round(
+        Number.isFinite(requestedWidth) && requestedWidth > 0
+          ? requestedWidth
+          : document.documentElement.clientWidth || window.innerWidth || 1
+      ));
+      const height = Math.max(1, Math.round(
+        Number.isFinite(requestedHeight) && requestedHeight > 0
+          ? requestedHeight
+          : document.documentElement.clientHeight || window.innerHeight || 1
+      ));
+      const signature = `${width}x${height}`;
+      if (signature === lastPlayerSize) return false;
+      lastPlayerSize = signature;
+      player.setSize(width, height);
+      return true;
+    }
+
+    function schedulePlayerResize(requestedSize = null) {
+      if (playerResizeFrame) cancelAnimationFrame(playerResizeFrame);
+      playerResizeFrame = requestAnimationFrame(() => {
+        playerResizeFrame = 0;
+        resizePlayer(requestedSize);
+      });
     }
 
     function executeCommand(message) {
@@ -277,6 +308,9 @@
           shuffleEnabled = !!value;
           if (mediaType === "playlist") player.setShuffle?.(shuffleEnabled);
           break;
+        case "setViewportSize":
+          schedulePlayerResize(value);
+          return;
         case "getState":
           publishState("snapshot");
           return;
@@ -304,6 +338,7 @@
         iframe.referrerPolicy = "strict-origin-when-cross-origin";
         iframe.setAttribute("allow", "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share");
       }
+      resizePlayer();
       postBridgeEvent("ready", getPlayerSnapshot());
       while (pendingCommands.length) executeCommand(pendingCommands.shift());
     }
@@ -353,6 +388,13 @@
       }
       player = new YT.Player("player", config);
     };
+
+    window.addEventListener("resize", () => schedulePlayerResize());
+    window.visualViewport?.addEventListener("resize", () => schedulePlayerResize());
+    if (typeof ResizeObserver === "function") {
+      const resizeObserver = new ResizeObserver(() => schedulePlayerResize());
+      resizeObserver.observe(document.documentElement);
+    }
 
     if (!mediaType) {
       playerContainer.innerHTML = '<div class="message">Aucune vidéo ou playlist valide n’a été fournie.</div>';
