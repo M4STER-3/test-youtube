@@ -81,6 +81,9 @@
     let lastVolumeSignature = "";
     let playerResizeFrame = 0;
     let lastPlayerSize = "";
+    let playlistEndedTimer = 0;
+    let playlistEndedRecoveryTimer = 0;
+    let playlistEndedSequence = 0;
     const pendingCommands = [];
 
     try {
@@ -144,6 +147,89 @@
       postBridgeEvent(event, getPlayerSnapshot());
     }
 
+    function clearPlaylistEndedRecovery() {
+      window.clearTimeout(playlistEndedTimer);
+      window.clearTimeout(playlistEndedRecoveryTimer);
+      playlistEndedTimer = 0;
+      playlistEndedRecoveryTimer = 0;
+      playlistEndedSequence += 1;
+    }
+
+    function getSafePlaylistState() {
+      const playlist = player?.getPlaylist?.();
+      const index = Number(player?.getPlaylistIndex?.());
+      return {
+        playlist: Array.isArray(playlist) ? playlist : [],
+        index: Number.isFinite(index) && index >= 0 ? Math.floor(index) : Math.max(0, playlistPosition),
+        videoId: getCurrentVideoId(),
+      };
+    }
+
+    function advancePlaylistAfterEnded(expectedGeneration, expectedSequence, endedState) {
+      if (
+        expectedGeneration !== playerGeneration ||
+        expectedSequence !== playlistEndedSequence ||
+        !playerReady ||
+        !player ||
+        mediaType !== "playlist" ||
+        !playbackIntent ||
+        ![-1, 0, 2, 5].includes(player.getPlayerState?.())
+      ) return;
+
+      const current = getSafePlaylistState();
+      if (
+        (endedState.videoId && current.videoId && endedState.videoId !== current.videoId) ||
+        current.index !== endedState.index
+      ) return;
+
+      const length = current.playlist.length;
+      if (length && current.index >= length - 1 && !loopEnabled) {
+        playbackIntent = false;
+        publishState("state");
+        return;
+      }
+
+      playbackIntent = true;
+      const nextIndex = length ? (current.index + 1) % length : current.index + 1;
+      playlistPosition = nextIndex;
+      if (length) player.playVideoAt?.(nextIndex);
+      else player.nextVideo?.();
+
+      playlistEndedRecoveryTimer = window.setTimeout(() => {
+        playlistEndedRecoveryTimer = 0;
+        if (
+          expectedGeneration !== playerGeneration ||
+          expectedSequence !== playlistEndedSequence ||
+          !playerReady ||
+          !player ||
+          !playbackIntent ||
+          ![-1, 0, 2, 5].includes(player.getPlayerState?.())
+        ) return;
+        if (length) {
+          player.playVideoAt?.(nextIndex);
+          player.playVideo?.();
+        } else if (playlistId) {
+          player.loadPlaylist?.({
+            listType: "playlist",
+            list: playlistId,
+            index: nextIndex,
+            startSeconds: 0,
+          });
+        }
+      }, 1400);
+    }
+
+    function schedulePlaylistEndedRecovery(generation) {
+      clearPlaylistEndedRecovery();
+      if (mediaType !== "playlist" || !playbackIntent) return;
+      const sequence = playlistEndedSequence;
+      const endedState = getSafePlaylistState();
+      playlistEndedTimer = window.setTimeout(() => {
+        playlistEndedTimer = 0;
+        advancePlaylistAfterEnded(generation, sequence, endedState);
+      }, 850);
+    }
+
     function resizePlayer(requestedSize = null) {
       if (!playerReady || !player?.setSize) return false;
       const requestedWidth = Number(requestedSize?.width);
@@ -182,6 +268,7 @@
       const value = message.value;
       switch (command) {
         case "loadMedia": {
+          clearPlaylistEndedRecovery();
           const nextType = value?.type === "playlist" ? "playlist" : "video";
           const nextPlaylistId = playlistIdPattern.test(String(value?.playlistId || ""))
             ? String(value.playlistId)
@@ -239,6 +326,7 @@
           else player.pauseVideo?.();
           break;
         case "next":
+          clearPlaylistEndedRecovery();
           playbackIntent = true;
           if (mediaType === "playlist") {
             const playlist = player.getPlaylist?.();
@@ -262,6 +350,7 @@
           }
           break;
         case "previous":
+          clearPlaylistEndedRecovery();
           playbackIntent = true;
           if (mediaType === "playlist") {
             const playlist = player.getPlaylist?.();
@@ -285,6 +374,7 @@
           }
           break;
         case "first": {
+          clearPlaylistEndedRecovery();
           if (mediaType !== "playlist" || !playlistId) break;
           playbackIntent = true;
           playlistPosition = 0;
@@ -401,13 +491,18 @@
       if (mediaType === "playlist" && Number.isFinite(reportedPlaylistIndex) && reportedPlaylistIndex >= 0) {
         playlistPosition = reportedPlaylistIndex;
       }
+      if (event.data === 1) playbackIntent = true;
+      if (event.data === 2) playbackIntent = false;
       if (event.data === 0 && mediaType === "video" && loopEnabled) {
         playbackIntent = true;
         player.seekTo?.(0, true);
         player.playVideo?.();
       }
-      if (event.data === 1) playbackIntent = true;
-      if (event.data === 2) playbackIntent = false;
+      if (event.data === 0 && mediaType === "playlist") {
+        schedulePlaylistEndedRecovery(generation);
+      } else if (event.data === 1 || event.data === 2 || event.data === 3) {
+        clearPlaylistEndedRecovery();
+      }
       publishState("state");
     }
 
@@ -458,6 +553,7 @@
 
     function recreatePlayerForPresentation(nextMode) {
       if (nextMode === presentationMode) return;
+      clearPlaylistEndedRecovery();
       const snapshot = getPlayerSnapshot();
       presentationMode = nextMode;
       playerReady = false;
