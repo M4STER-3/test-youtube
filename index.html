@@ -75,6 +75,7 @@
     let playerGeneration = 0;
     let loopEnabled = false;
     let shuffleEnabled = false;
+    let playbackIntent = false;
     let playlistPosition = initialPlaylistIndex;
     let parentOrigin = "*";
     let lastVolumeSignature = "";
@@ -126,6 +127,7 @@
       }
       return {
         state: player.getPlayerState?.(),
+        shouldPlay: playbackIntent || player.getPlayerState?.() === 1 || player.getPlayerState?.() === 3,
         volume: player.getVolume?.(),
         muted: !!player.isMuted?.(),
         playlistIndex: playlistPosition,
@@ -191,6 +193,7 @@
             ? value.playlistIds.map((id) => String(id || "")).filter((id) => videoIdPattern.test(id)).slice(0, 1000)
             : [];
           const autoplay = value?.autoplay !== false;
+          playbackIntent = autoplay;
           if (nextType === "playlist" && nextPlaylistId) {
             mediaType = "playlist";
             playlistId = nextPlaylistId;
@@ -223,16 +226,20 @@
           break;
         }
         case "play":
+          playbackIntent = true;
           player.playVideo?.();
           break;
         case "pause":
+          playbackIntent = false;
           player.pauseVideo?.();
           break;
         case "toggle":
-          if (player.getPlayerState?.() === 1) player.pauseVideo?.();
-          else player.playVideo?.();
+          playbackIntent = player.getPlayerState?.() !== 1;
+          if (playbackIntent) player.playVideo?.();
+          else player.pauseVideo?.();
           break;
         case "next":
+          playbackIntent = true;
           if (mediaType === "playlist") {
             const playlist = player.getPlaylist?.();
             if (shuffleEnabled && Array.isArray(playlist) && playlist.length) {
@@ -255,6 +262,7 @@
           }
           break;
         case "previous":
+          playbackIntent = true;
           if (mediaType === "playlist") {
             const playlist = player.getPlaylist?.();
             if (shuffleEnabled && Array.isArray(playlist) && playlist.length) {
@@ -278,6 +286,7 @@
           break;
         case "first": {
           if (mediaType !== "playlist" || !playlistId) break;
+          playbackIntent = true;
           playlistPosition = 0;
           const playlist = player.getPlaylist?.();
           if (Array.isArray(playlist) && playlist.length) {
@@ -293,6 +302,7 @@
           break;
         }
         case "restart":
+          playbackIntent = true;
           player.seekTo?.(0, true);
           player.playVideo?.();
           break;
@@ -341,7 +351,8 @@
       if (!snapshot || !player) return;
       const index = Math.max(0, Number(snapshot.playlistIndex) || 0);
       const startSeconds = Math.max(0, Number(snapshot.currentTime) || 0);
-      const shouldPlay = snapshot.state === 1 || snapshot.state === 3;
+      const shouldPlay = snapshot.shouldPlay === true || snapshot.state === 1 || snapshot.state === 3;
+      playbackIntent = shouldPlay;
       if (mediaType === "playlist" && playlistId) {
         const playlist = Array.isArray(snapshot.playlist)
           ? snapshot.playlist.filter((id) => videoIdPattern.test(String(id || "")))
@@ -391,9 +402,12 @@
         playlistPosition = reportedPlaylistIndex;
       }
       if (event.data === 0 && mediaType === "video" && loopEnabled) {
+        playbackIntent = true;
         player.seekTo?.(0, true);
         player.playVideo?.();
       }
+      if (event.data === 1) playbackIntent = true;
+      if (event.data === 2) playbackIntent = false;
       publishState("state");
     }
 
