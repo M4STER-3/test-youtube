@@ -68,9 +68,11 @@
     let mediaType = playlistId ? "playlist" : (videoId ? "video" : "");
     const initialPlaylistIndex = Math.max(0, Number.parseInt(params.get("index") || "0", 10) || 0);
     const playerContainer = document.getElementById("player");
+    let presentationMode = params.get("presentation") === "background" ? "background" : "mini";
 
     let player = null;
     let playerReady = false;
+    let playerGeneration = 0;
     let loopEnabled = false;
     let shuffleEnabled = false;
     let playlistPosition = initialPlaylistIndex;
@@ -130,6 +132,7 @@
         playlistLength: Array.isArray(playlist) ? playlist.length : 0,
         playlist: Array.isArray(playlist) ? playlist : [],
         currentVideoId: getCurrentVideoId(),
+        currentTime: Math.max(0, Number(player.getCurrentTime?.()) || 0),
         title: videoData.title || "",
         author: videoData.author || "",
       };
@@ -308,6 +311,9 @@
           shuffleEnabled = !!value;
           if (mediaType === "playlist") player.setShuffle?.(shuffleEnabled);
           break;
+        case "setPresentationMode":
+          recreatePlayerForPresentation(value === "background" ? "background" : "mini");
+          return;
         case "setViewportSize":
           schedulePlayerResize(value);
           return;
@@ -331,7 +337,41 @@
       executeCommand(message);
     });
 
-    function onPlayerReady() {
+    function restorePlayerSnapshot(snapshot) {
+      if (!snapshot || !player) return;
+      const index = Math.max(0, Number(snapshot.playlistIndex) || 0);
+      const startSeconds = Math.max(0, Number(snapshot.currentTime) || 0);
+      const shouldPlay = snapshot.state === 1 || snapshot.state === 3;
+      if (mediaType === "playlist" && playlistId) {
+        const playlist = Array.isArray(snapshot.playlist)
+          ? snapshot.playlist.filter((id) => videoIdPattern.test(String(id || "")))
+          : [];
+        const command = playlist.length
+          ? [playlist, Math.min(index, playlist.length - 1), startSeconds]
+          : [{ listType: "playlist", list: playlistId, index, startSeconds }];
+        if (shouldPlay) player.loadPlaylist?.(...command);
+        else player.cuePlaylist?.(...command);
+      } else {
+        const currentId = videoIdPattern.test(String(snapshot.currentVideoId || ""))
+          ? String(snapshot.currentVideoId)
+          : videoId;
+        if (currentId) {
+          const command = { videoId: currentId, startSeconds };
+          if (shouldPlay) player.loadVideoById?.(command);
+          else player.cueVideoById?.(command);
+        }
+      }
+      player.setVolume?.(Math.max(0, Math.min(100, Number(snapshot.volume) || 0)));
+      if (snapshot.muted) player.mute?.();
+      else player.unMute?.();
+      if (mediaType === "playlist") {
+        player.setLoop?.(loopEnabled);
+        player.setShuffle?.(shuffleEnabled);
+      }
+    }
+
+    function onPlayerReady(generation, restoreSnapshot = null) {
+      if (generation !== playerGeneration) return;
       playerReady = true;
       const iframe = player.getIframe?.();
       if (iframe) {
@@ -339,11 +379,13 @@
         iframe.setAttribute("allow", "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share");
       }
       resizePlayer();
+      restorePlayerSnapshot(restoreSnapshot);
       postBridgeEvent("ready", getPlayerSnapshot());
       while (pendingCommands.length) executeCommand(pendingCommands.shift());
     }
 
-    function onPlayerStateChange(event) {
+    function onPlayerStateChange(event, generation) {
+      if (generation !== playerGeneration) return;
       const reportedPlaylistIndex = Number(player?.getPlaylistIndex?.());
       if (mediaType === "playlist" && Number.isFinite(reportedPlaylistIndex) && reportedPlaylistIndex >= 0) {
         playlistPosition = reportedPlaylistIndex;
@@ -355,38 +397,70 @@
       publishState("state");
     }
 
-    function onPlayerError(event) {
+    function onPlayerError(event, generation) {
+      if (generation !== playerGeneration) return;
       postBridgeEvent("error", {
         ...getPlayerSnapshot(),
         code: Number(event.data) || 0,
       });
     }
 
-    window.onYouTubeIframeAPIReady = function () {
+    function ensurePlayerTarget() {
+      if (document.getElementById("player")) return;
+      const target = document.createElement("div");
+      target.id = "player";
+      document.body.prepend(target);
+    }
+
+    function createYoutubePlayer(restoreSnapshot = null) {
+      ensurePlayerTarget();
+      const generation = ++playerGeneration;
       const config = {
         width: "100%",
         height: "100%",
         playerVars: {
           playsinline: 1,
           rel: 0,
-          controls: 1,
+          controls: presentationMode === "background" ? 0 : 1,
+          disablekb: presentationMode === "background" ? 1 : 0,
           enablejsapi: 1,
         },
         events: {
-          onReady: onPlayerReady,
-          onStateChange: onPlayerStateChange,
-          onError: onPlayerError,
+          onReady: () => onPlayerReady(generation, restoreSnapshot),
+          onStateChange: (event) => onPlayerStateChange(event, generation),
+          onError: (event) => onPlayerError(event, generation),
         },
       };
-      if (mediaType === "playlist") {
+      if (!restoreSnapshot && mediaType === "playlist") {
         config.playerVars.listType = "playlist";
         config.playerVars.list = playlistId;
         config.playerVars.index = playlistPosition;
         if (videoId) config.videoId = videoId;
-      } else {
+      } else if (!restoreSnapshot) {
         config.videoId = videoId;
       }
       player = new YT.Player("player", config);
+    }
+
+    function recreatePlayerForPresentation(nextMode) {
+      if (nextMode === presentationMode) return;
+      const snapshot = getPlayerSnapshot();
+      presentationMode = nextMode;
+      playerReady = false;
+      const previousPlayer = player;
+      player = null;
+      ++playerGeneration;
+      try {
+        previousPlayer?.destroy?.();
+      } catch {
+        // Le nouveau lecteur remplacera proprement toute ancienne iframe restante.
+      }
+      ensurePlayerTarget();
+      createYoutubePlayer(snapshot);
+    }
+
+    window.onYouTubeIframeAPIReady = function () {
+      createYoutubePlayer();
     };
 
     window.addEventListener("resize", () => schedulePlayerResize());
