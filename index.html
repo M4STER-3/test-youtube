@@ -441,11 +441,29 @@
           clearPlaylistEndedRecovery();
           if (mediaType !== "playlist" || !playlistId) break;
           playbackIntent = true;
-          playlistPosition = 0;
           const playlist = player.getPlaylist?.();
           if (Array.isArray(playlist) && playlist.length) {
-            player.playVideoAt?.(0);
+            const canonicalFirstId = canonicalPlaylistIds[0] || "";
+            const runtimeFirstIndex = canonicalFirstId
+              ? playlist.indexOf(canonicalFirstId)
+              : 0;
+            if (runtimeFirstIndex >= 0) {
+              playlistPosition = runtimeFirstIndex;
+              player.playVideoAt?.(runtimeFirstIndex);
+            } else if (canonicalPlaylistIds.length) {
+              playlistPosition = 0;
+              playlistModesPending = true;
+              player.loadPlaylist?.(canonicalPlaylistIds, 0, 0);
+            } else {
+              playlistPosition = 0;
+              reloadPlaylistAt(0, true);
+            }
+          } else if (canonicalPlaylistIds.length) {
+            playlistPosition = 0;
+            playlistModesPending = true;
+            player.loadPlaylist?.(canonicalPlaylistIds, 0, 0);
           } else {
+            playlistPosition = 0;
             reloadPlaylistAt(0, true);
           }
           break;
