@@ -91,6 +91,7 @@
     let activePlaylistNavigation = null;
     let playbackIntentPauseTimer = 0;
     let playbackIntentProtectedUntil = 0;
+    let playbackPausedWhileHidden = false;
     let canonicalPlaylistIds = [];
     const pendingCommands = [];
 
@@ -185,9 +186,17 @@
       window.clearTimeout(playbackIntentPauseTimer);
       playbackIntentPauseTimer = 0;
       if (!playbackIntent || activePlaylistNavigation) return;
+      if (document.hidden) {
+        playbackPausedWhileHidden = true;
+        return;
+      }
       const remaining = Math.max(1500, playbackIntentProtectedUntil - Date.now());
       playbackIntentPauseTimer = window.setTimeout(() => {
         playbackIntentPauseTimer = 0;
+        if (document.hidden) {
+          playbackPausedWhileHidden = true;
+          return;
+        }
         if (
           generation === playerGeneration &&
           playerReady &&
@@ -695,7 +704,10 @@
       if (mediaType === "playlist" && Number.isFinite(reportedPlaylistIndex) && reportedPlaylistIndex >= 0) {
         playlistPosition = reportedPlaylistIndex;
       }
-      if (event.data === 1) setPlaybackIntent(true);
+      if (event.data === 1) {
+        playbackPausedWhileHidden = false;
+        setPlaybackIntent(true);
+      }
       if (event.data === 2) observePausedPlaybackIntent(generation);
       if (mediaType === "playlist" && (event.data === 1 || event.data === 5)) {
         applyPlaylistModes();
@@ -790,6 +802,20 @@
     };
 
     window.addEventListener("resize", () => schedulePlayerResize());
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden || !playbackPausedWhileHidden) return;
+      playbackPausedWhileHidden = false;
+      if (
+        playbackIntent &&
+        playerReady &&
+        player &&
+        mediaType === "playlist" &&
+        player.getPlayerState?.() === 2
+      ) {
+        setPlaybackIntent(true, 5000);
+        player.playVideo?.();
+      }
+    });
     window.visualViewport?.addEventListener("resize", () => schedulePlayerResize());
     if (typeof ResizeObserver === "function") {
       const resizeObserver = new ResizeObserver(() => schedulePlayerResize());
