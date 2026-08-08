@@ -98,6 +98,7 @@
     let playlistStallSince = 0;
     let lastPlaylistRecoveryAt = 0;
     let lastPlaylistHeartbeatSignature = "";
+    const shuffleCycleHandledVideoIds = new Set();
     const pendingCommands = [];
 
     try {
@@ -228,6 +229,45 @@
       };
     }
 
+    function isPlayerNearVideoEnd() {
+      const duration = Math.max(0, Number(player?.getDuration?.()) || 0);
+      const currentTime = Math.max(0, Number(player?.getCurrentTime?.()) || 0);
+      return duration > 0 && currentTime >= Math.max(0, duration - 1.25);
+    }
+
+    function resetShuffleCycle(currentVideoId = "") {
+      shuffleCycleHandledVideoIds.clear();
+      const cleanId = String(currentVideoId || "");
+      if (shuffleEnabled && videoIdPattern.test(cleanId)) {
+        shuffleCycleHandledVideoIds.add(cleanId);
+      }
+    }
+
+    function markShuffleCycleVideoHandled(currentVideoId = "") {
+      if (!shuffleEnabled) return;
+      const cleanId = String(currentVideoId || "");
+      if (videoIdPattern.test(cleanId)) shuffleCycleHandledVideoIds.add(cleanId);
+    }
+
+    function getShuffleCycleCandidates(current = getSafePlaylistState()) {
+      const runtimeIds = current.playlist
+        .map((id) => String(id || ""))
+        .filter((id) => videoIdPattern.test(id));
+      const source = runtimeIds.length
+        ? runtimeIds
+        : canonicalPlaylistIds.filter((id) => videoIdPattern.test(String(id || "")));
+      return source.filter((id) => !shuffleCycleHandledVideoIds.has(id));
+    }
+
+    function shuffleCycleIsComplete(current = getSafePlaylistState()) {
+      if (!shuffleEnabled) return false;
+      const source = current.playlist.length ? current.playlist : canonicalPlaylistIds;
+      const knownIds = [...new Set(source
+        .map((id) => String(id || ""))
+        .filter((id) => videoIdPattern.test(id)))];
+      return knownIds.length > 0 && knownIds.every((id) => shuffleCycleHandledVideoIds.has(id));
+    }
+
     function markPlaylistModesPending() {
       if (mediaType === "playlist") playlistModesPending = true;
     }
@@ -348,17 +388,26 @@
       }
       lastPlaylistRecoveryAt = now;
       if (state === 2 && current.videoId) {
+        if (current.playlist.length && isPlayerNearVideoEnd()) {
+          markShuffleCycleVideoHandled(current.videoId);
+          return startPlaylistNavigation(1, "ended");
+        }
         setPlaybackIntent(true, 5000);
         player.playVideo?.();
         return true;
       }
       if (state === 0 && current.playlist.length) {
-        if (current.index >= current.playlist.length - 1 && !loopEnabled) {
+        markShuffleCycleVideoHandled(current.videoId);
+        if (
+          !loopEnabled &&
+          ((!shuffleEnabled && current.index >= current.playlist.length - 1) ||
+            (shuffleEnabled && shuffleCycleIsComplete(current)))
+        ) {
           setPlaybackIntent(false);
           publishState("state");
           return false;
         }
-        return startPlaylistNavigation(1, reason);
+        return startPlaylistNavigation(1, "ended");
       }
       if (state === 5 && current.videoId && current.playlist.length) {
         setPlaybackIntent(true, 5000);
@@ -384,8 +433,23 @@
     function getPlaylistNavigationTarget(navigation, current) {
       const length = current.playlist.length;
       if (!length) return Math.max(0, navigation.startIndex + navigation.direction);
-      if (navigation.reason === "ended" && navigation.direction > 0 && navigation.startIndex >= length - 1 && !loopEnabled) {
-        return -1;
+      if (navigation.reason === "ended" && navigation.direction > 0 && !loopEnabled) {
+        if (!shuffleEnabled && navigation.startIndex >= length - 1) return -1;
+        if (shuffleEnabled) {
+          if (
+            Number.isInteger(navigation.targetIndex) &&
+            navigation.targetIndex >= 0 &&
+            navigation.targetIndex < length
+          ) return navigation.targetIndex;
+          const candidates = getShuffleCycleCandidates(current);
+          if (!candidates.length) return -1;
+          const targetId = candidates[Math.floor(Math.random() * candidates.length)];
+          const targetIndex = current.playlist.indexOf(targetId);
+          if (targetIndex >= 0) {
+            navigation.targetIndex = targetIndex;
+            return targetIndex;
+          }
+        }
       }
       return (navigation.startIndex + navigation.direction + length) % length;
     }
@@ -419,7 +483,10 @@
       playlistPosition = targetIndex;
       if (navigation.attempt === 1) {
         if (current.playlist.length) {
-          if (shuffleEnabled) {
+          if (shuffleEnabled && navigation.reason === "ended") {
+            player.playVideoAt?.(targetIndex);
+            player.playVideo?.();
+          } else if (shuffleEnabled) {
             if (navigation.direction < 0) player.previousVideo?.();
             else player.nextVideo?.();
           } else {
@@ -486,6 +553,7 @@
         reason,
         startIndex: current.index,
         startVideoId: current.videoId,
+        targetIndex: null,
         attempt: 0,
       };
       runPlaylistNavigationAttempt(activePlaylistNavigation);
@@ -507,10 +575,27 @@
       if (
         (endedState.videoId && current.videoId && endedState.videoId !== current.videoId) ||
         current.index !== endedState.index
-      ) return;
+      ) {
+        playlistEndedRecoveryTimer = window.setTimeout(() => {
+          playlistEndedRecoveryTimer = 0;
+          if (
+            expectedGeneration !== playerGeneration ||
+            expectedSequence !== playlistEndedSequence ||
+            !playbackIntent
+          ) return;
+          recoverPlaylistPlayback("ended-index-advanced");
+        }, 450);
+        return;
+      }
 
       const length = current.playlist.length;
-      if (length && current.index >= length - 1 && !loopEnabled) {
+      markShuffleCycleVideoHandled(current.videoId || endedState.videoId);
+      if (
+        length &&
+        !loopEnabled &&
+        ((!shuffleEnabled && current.index >= length - 1) ||
+          (shuffleEnabled && shuffleCycleIsComplete(current)))
+      ) {
         playbackIntent = false;
         publishState("state");
         return;
@@ -595,6 +680,7 @@
             if (typeof value?.loop === "boolean") loopEnabled = value.loop;
             playlistPosition = Math.max(0, Number(value?.index) || 0);
             canonicalPlaylistIds = [...nextPlaylistIds];
+            resetShuffleCycle();
             loadPlaylistSourceAt(playlistPosition, autoplay);
           } else if (nextVideoId) {
             mediaType = "video";
@@ -650,6 +736,7 @@
           clearPlaylistNavigation();
           if (mediaType !== "playlist" || !playlistId) break;
           setPlaybackIntent(true, 5000);
+          resetShuffleCycle(canonicalPlaylistIds[0] || "");
           const playlist = player.getPlaylist?.();
           if (Array.isArray(playlist) && playlist.length) {
             const canonicalFirstId = canonicalPlaylistIds[0] || "";
@@ -696,7 +783,10 @@
           if (mediaType === "playlist") applyPlaylistModes(true);
           break;
         case "setShuffle":
-          shuffleEnabled = !!value;
+          if (shuffleEnabled !== !!value) {
+            shuffleEnabled = !!value;
+            resetShuffleCycle(getCurrentVideoId());
+          }
           if (mediaType === "playlist") applyPlaylistModes(true);
           break;
         case "setPresentationMode":
@@ -797,9 +887,16 @@
       if (event.data === 1) {
         playbackPausedWhileHidden = false;
         playlistStallSince = 0;
+        markShuffleCycleVideoHandled(getCurrentVideoId());
         setPlaybackIntent(true);
       }
-      if (event.data === 2) observePausedPlaybackIntent(generation);
+      if (event.data === 2) {
+        if (mediaType === "playlist" && playbackIntent && isPlayerNearVideoEnd()) {
+          schedulePlaylistEndedRecovery(generation);
+        } else {
+          observePausedPlaybackIntent(generation);
+        }
+      }
       if (mediaType === "playlist" && (event.data === 1 || event.data === 5)) {
         applyPlaylistModes();
       }
@@ -824,6 +921,7 @@
     function onPlayerError(event, generation) {
       if (generation !== playerGeneration) return;
       if (mediaType === "playlist" && [100, 101, 150].includes(Number(event.data))) {
+        markShuffleCycleVideoHandled(getCurrentVideoId());
         clearPlaylistNavigation();
       }
       postBridgeEvent("error", {
