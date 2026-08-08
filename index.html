@@ -93,6 +93,11 @@
     let playbackIntentProtectedUntil = 0;
     let playbackPausedWhileHidden = false;
     let canonicalPlaylistIds = [];
+    let initialMediaLoadTimer = 0;
+    let initialMediaCommandReceived = false;
+    let playlistStallSince = 0;
+    let lastPlaylistRecoveryAt = 0;
+    let lastPlaylistHeartbeatSignature = "";
     const pendingCommands = [];
 
     try {
@@ -261,19 +266,111 @@
       return true;
     }
 
-    function reloadPlaylistAt(index, autoplay = true) {
+    function loadPlaylistSourceAt(index, autoplay = true, startSeconds = 0, preferredVideoId = "") {
       if (!playlistId) return false;
-      playlistPosition = Math.max(0, Number(index) || 0);
+      const playlist = canonicalPlaylistIds.filter((id) => videoIdPattern.test(String(id || "")));
+      const preferredIndex = videoIdPattern.test(String(preferredVideoId || ""))
+        ? playlist.indexOf(String(preferredVideoId))
+        : -1;
+      const requestedIndex = preferredIndex >= 0 ? preferredIndex : Math.max(0, Number(index) || 0);
+      playlistPosition = playlist.length
+        ? Math.min(requestedIndex, playlist.length - 1)
+        : requestedIndex;
       markPlaylistModesPending();
-      const command = {
-        listType: "playlist",
-        list: playlistId,
-        index: playlistPosition,
-        startSeconds: 0,
-      };
-      if (autoplay) player.loadPlaylist?.(command);
-      else player.cuePlaylist?.(command);
+      if (playlist.length) {
+        if (autoplay) player.loadPlaylist?.(playlist, playlistPosition, Math.max(0, Number(startSeconds) || 0));
+        else player.cuePlaylist?.(playlist, playlistPosition, Math.max(0, Number(startSeconds) || 0));
+      } else {
+        const command = {
+          listType: "playlist",
+          list: playlistId,
+          index: playlistPosition,
+          startSeconds: Math.max(0, Number(startSeconds) || 0),
+        };
+        if (autoplay) player.loadPlaylist?.(command);
+        else player.cuePlaylist?.(command);
+      }
       return true;
+    }
+
+    function reloadPlaylistAt(index, autoplay = true) {
+      return loadPlaylistSourceAt(index, autoplay);
+    }
+
+    function clearInitialMediaLoad() {
+      window.clearTimeout(initialMediaLoadTimer);
+      initialMediaLoadTimer = 0;
+    }
+
+    function scheduleInitialQueryMediaLoad(generation) {
+      clearInitialMediaLoad();
+      initialMediaLoadTimer = window.setTimeout(() => {
+        initialMediaLoadTimer = 0;
+        if (
+          generation !== playerGeneration ||
+          !playerReady ||
+          !player ||
+          initialMediaCommandReceived
+        ) return;
+        executeCommand({
+          command: "loadMedia",
+          value: mediaType === "playlist"
+            ? {
+                type: "playlist",
+                playlistId,
+                index: playlistPosition,
+                autoplay: true,
+                shuffle: shuffleEnabled,
+                loop: loopEnabled,
+              }
+            : { type: "video", videoId, autoplay: true },
+          source: "initial-query",
+        });
+      }, 300);
+    }
+
+    function recoverPlaylistPlayback(reason = "resume") {
+      if (
+        document.hidden ||
+        !playbackIntent ||
+        !playerReady ||
+        !player ||
+        mediaType !== "playlist" ||
+        !playlistId
+      ) return false;
+      const now = Date.now();
+      if (now - lastPlaylistRecoveryAt < 900) return false;
+      const state = Number(player.getPlayerState?.());
+      const current = getSafePlaylistState();
+      if (state === 1 || state === 3) {
+        playlistStallSince = 0;
+        return false;
+      }
+      lastPlaylistRecoveryAt = now;
+      if (state === 2 && current.videoId) {
+        setPlaybackIntent(true, 5000);
+        player.playVideo?.();
+        return true;
+      }
+      if (state === 0 && current.playlist.length) {
+        if (current.index >= current.playlist.length - 1 && !loopEnabled) {
+          setPlaybackIntent(false);
+          publishState("state");
+          return false;
+        }
+        return startPlaylistNavigation(1, reason);
+      }
+      if (state === 5 && current.videoId && current.playlist.length) {
+        setPlaybackIntent(true, 5000);
+        player.playVideo?.();
+        return true;
+      }
+      const canonicalIndex = current.videoId
+        ? canonicalPlaylistIds.indexOf(current.videoId)
+        : -1;
+      const targetIndex = canonicalIndex >= 0 ? canonicalIndex : Math.max(0, playlistPosition);
+      setPlaybackIntent(true, 5000);
+      return loadPlaylistSourceAt(targetIndex, true, 0, current.videoId);
     }
 
     function playlistNavigationSucceeded(navigation, current = getSafePlaylistState()) {
@@ -471,9 +568,13 @@
       const value = message.value;
       switch (command) {
         case "loadMedia": {
+          initialMediaCommandReceived = true;
+          clearInitialMediaLoad();
           clearPlaylistEndedRecovery();
           clearPlaylistNavigation();
           playlistNavigationPending = 0;
+          playlistStallSince = 0;
+          playbackPausedWhileHidden = false;
           const nextType = value?.type === "playlist" ? "playlist" : "video";
           const nextPlaylistId = playlistIdPattern.test(String(value?.playlistId || ""))
             ? String(value.playlistId)
@@ -494,21 +595,7 @@
             if (typeof value?.loop === "boolean") loopEnabled = value.loop;
             playlistPosition = Math.max(0, Number(value?.index) || 0);
             canonicalPlaylistIds = [...nextPlaylistIds];
-            markPlaylistModesPending();
-            if (nextPlaylistIds.length) {
-              playlistPosition = Math.min(playlistPosition, nextPlaylistIds.length - 1);
-              if (autoplay) player.loadPlaylist?.(nextPlaylistIds, playlistPosition, 0);
-              else player.cuePlaylist?.(nextPlaylistIds, playlistPosition, 0);
-            } else {
-              const playlistCommand = {
-                listType: "playlist",
-                list: playlistId,
-                index: playlistPosition,
-                startSeconds: 0,
-              };
-              if (autoplay) player.loadPlaylist?.(playlistCommand);
-              else player.cuePlaylist?.(playlistCommand);
-            }
+            loadPlaylistSourceAt(playlistPosition, autoplay);
           } else if (nextVideoId) {
             mediaType = "video";
             playlistModesPending = false;
@@ -621,6 +708,10 @@
         case "getState":
           publishState("snapshot");
           return;
+        case "recover":
+          recoverPlaylistPlayback("parent-resume");
+          window.setTimeout(() => publishState("snapshot"), 120);
+          return;
         default:
           return;
       }
@@ -662,12 +753,8 @@
           : Number(snapshot.canonicalPlaylistIndex) >= 0
             ? Math.min(Number(snapshot.canonicalPlaylistIndex), Math.max(0, playlist.length - 1))
             : Math.min(index, Math.max(0, playlist.length - 1));
-        const command = playlist.length
-          ? [playlist, restoredIndex, startSeconds]
-          : [{ listType: "playlist", list: playlistId, index, startSeconds }];
-        markPlaylistModesPending();
-        if (shouldPlay) player.loadPlaylist?.(...command);
-        else player.cuePlaylist?.(...command);
+        playlistPosition = restoredIndex;
+        loadPlaylistSourceAt(restoredIndex, shouldPlay, startSeconds, currentId);
       } else {
         const currentId = videoIdPattern.test(String(snapshot.currentVideoId || ""))
           ? String(snapshot.currentVideoId)
@@ -696,6 +783,9 @@
       restorePlayerSnapshot(restoreSnapshot);
       postBridgeEvent("ready", getPlayerSnapshot());
       while (pendingCommands.length) executeCommand(pendingCommands.shift());
+      if (!restoreSnapshot && !initialMediaCommandReceived && window.parent === window) {
+        scheduleInitialQueryMediaLoad(generation);
+      }
     }
 
     function onPlayerStateChange(event, generation) {
@@ -706,6 +796,7 @@
       }
       if (event.data === 1) {
         playbackPausedWhileHidden = false;
+        playlistStallSince = 0;
         setPlaybackIntent(true);
       }
       if (event.data === 2) observePausedPlaybackIntent(generation);
@@ -767,14 +858,6 @@
           onError: (event) => onPlayerError(event, generation),
         },
       };
-      if (!restoreSnapshot && mediaType === "playlist") {
-        config.playerVars.listType = "playlist";
-        config.playerVars.list = playlistId;
-        config.playerVars.index = playlistPosition;
-        if (videoId) config.videoId = videoId;
-      } else if (!restoreSnapshot) {
-        config.videoId = videoId;
-      }
       player = new YT.Player("player", config);
     }
 
@@ -803,18 +886,12 @@
 
     window.addEventListener("resize", () => schedulePlayerResize());
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden || !playbackPausedWhileHidden) return;
+      if (document.hidden) return;
+      const shouldRecover = playbackPausedWhileHidden || playbackIntent;
       playbackPausedWhileHidden = false;
-      if (
-        playbackIntent &&
-        playerReady &&
-        player &&
-        mediaType === "playlist" &&
-        player.getPlayerState?.() === 2
-      ) {
-        setPlaybackIntent(true, 5000);
-        player.playVideo?.();
-      }
+      if (!shouldRecover || mediaType !== "playlist") return;
+      window.setTimeout(() => recoverPlaylistPlayback("visibility"), 120);
+      window.setTimeout(() => recoverPlaylistPlayback("visibility-confirm"), 1200);
     });
     window.visualViewport?.addEventListener("resize", () => schedulePlayerResize());
     if (typeof ResizeObserver === "function") {
@@ -834,9 +911,28 @@
       window.setInterval(() => {
         if (!playerReady || !player) return;
         const signature = `${player.getVolume?.()}-${!!player.isMuted?.()}`;
-        if (signature === lastVolumeSignature) return;
-        lastVolumeSignature = signature;
-        publishState("volume");
+        if (signature !== lastVolumeSignature) {
+          lastVolumeSignature = signature;
+          publishState("volume");
+        }
+        if (mediaType !== "playlist") return;
+        const state = Number(player.getPlayerState?.());
+        const current = getSafePlaylistState();
+        const heartbeatSignature = `${state}-${current.index}-${current.videoId}-${current.playlist.length}`;
+        if (heartbeatSignature !== lastPlaylistHeartbeatSignature) {
+          lastPlaylistHeartbeatSignature = heartbeatSignature;
+          publishState("snapshot");
+        }
+        if (!playbackIntent || document.hidden || [1, 3].includes(state)) {
+          playlistStallSince = 0;
+          return;
+        }
+        if (![0, -1, 5].includes(state)) return;
+        if (!playlistStallSince) playlistStallSince = Date.now();
+        if (Date.now() - playlistStallSince >= 2400) {
+          recoverPlaylistPlayback("watchdog");
+          playlistStallSince = Date.now();
+        }
       }, 500);
     }
   </script>
