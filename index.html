@@ -84,6 +84,7 @@
     let playlistEndedTimer = 0;
     let playlistEndedRecoveryTimer = 0;
     let playlistEndedSequence = 0;
+    let playlistLastPlayingAt = 0;
     let playlistModesPending = false;
     let playlistNavigationPending = 0;
     let playlistNavigationTimer = 0;
@@ -607,12 +608,17 @@
     function schedulePlaylistEndedRecovery(generation) {
       clearPlaylistEndedRecovery();
       if (mediaType !== "playlist" || !playbackIntent) return;
+      const playedForMs = playlistLastPlayingAt ? Date.now() - playlistLastPlayingAt : 0;
+      if (playedForMs > 0 && playedForMs < 12000) {
+        publishState("state");
+        return;
+      }
       const sequence = playlistEndedSequence;
       const endedState = getSafePlaylistState();
       playlistEndedTimer = window.setTimeout(() => {
         playlistEndedTimer = 0;
         advancePlaylistAfterEnded(generation, sequence, endedState);
-      }, 850);
+      }, 4500);
     }
 
     function resizePlayer(requestedSize = null) {
@@ -885,6 +891,7 @@
         playlistPosition = reportedPlaylistIndex;
       }
       if (event.data === 1) {
+        if (mediaType === "playlist") playlistLastPlayingAt = Date.now();
         playbackPausedWhileHidden = false;
         playlistStallSince = 0;
         markShuffleCycleVideoHandled(getCurrentVideoId());
