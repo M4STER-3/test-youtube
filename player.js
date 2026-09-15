@@ -21,6 +21,14 @@ function cleanPlaylistIds(value) {
     : [];
 }
 
+const BRIDGE_VERSION = 2;
+const bridgeSession = params.get("session") || "";
+let externallyManaged = false;
+let transitionId = 0;
+let transitionConfirmed = false;
+let transitionEnded = false;
+let transitionErrored = false;
+
 const initialPlaylistId = cleanPlaylistId(params.get("playlist"));
 const initialVideoId = cleanVideoId(params.get("video"));
 const initialIndex = Math.max(0, Number.parseInt(params.get("index") || "0", 10) || 0);
@@ -123,6 +131,9 @@ function postBridgeEvent(event, data = {}) {
   window.parent.postMessage({
     channel: BRIDGE_CHANNEL,
     kind: "event",
+    protocolVersion: BRIDGE_VERSION,
+    session: bridgeSession,
+    transitionId,
     event,
     mediaType,
     videoId,
@@ -157,6 +168,9 @@ function getSnapshot() {
     canonicalPlaylistLength: playlistIds.length,
     canonicalPlaylist: [...playlistIds],
     currentVideoId,
+    requestedVideoId: videoId,
+    confirmedVideoId: getCurrentVideoId() === videoId ? getCurrentVideoId() : "",
+    externallyManaged,
     currentTime: Math.max(0, Number(player.getCurrentTime?.()) || 0),
     title: String(data.title || ""),
     author: String(data.author || ""),
@@ -200,7 +214,7 @@ function loadManagedIndex(index, autoplay = true, startSeconds = 0) {
   const command = { videoId: targetId, startSeconds: Math.max(0, Number(startSeconds) || 0) };
   const currentId = getCurrentVideoId();
   if (currentId === targetId) {
-    if (command.startSeconds > 0) player.seekTo?.(command.startSeconds, true);
+    player.seekTo?.(command.startSeconds, true);
     if (autoplay) player.playVideo?.();
     else player.pauseVideo?.();
   } else if (autoplay) {
@@ -213,6 +227,7 @@ function loadManagedIndex(index, autoplay = true, startSeconds = 0) {
 }
 
 function getManagedTarget(direction, reason = "manual") {
+  if (externallyManaged) return -1;
   if (!playlistIds.length) return -1;
   const step = direction < 0 ? -1 : 1;
   if (!shuffleEnabled) {
@@ -265,12 +280,21 @@ function scheduleManagedAdvance(generation, expectedIndex, expectedId) {
       publishState("state");
       return;
     }
-    navigateManaged(1, "ended");
+    if (externallyManaged) reportControlledEnd();
+    else navigateManaged(1, "ended");
   }, 450);
+}
+
+function reportControlledEnd() {
+  if (!externallyManaged || !transitionConfirmed || transitionEnded || transitionErrored) return;
+  transitionEnded = true;
+  playbackIntent = false;
+  postBridgeEvent("trackEnded", getSnapshot());
 }
 
 function updateCanonicalPlaylist(nextIds) {
   const ids = cleanPlaylistIds(nextIds);
+  if (externallyManaged) { playlistIds = ids; publishState("snapshot"); return !!ids.length; }
   if (!ids.length) return false;
   const oldIds = playlistIds;
   const loadedId = getCurrentVideoId();
@@ -307,6 +331,15 @@ function requestPlaylistData() {
 
 function loadMedia(value = {}) {
   clearEndedTimer();
+  externallyManaged = value.externalController === true && !!bridgeSession && value.protocolVersion === BRIDGE_VERSION;
+  if (externallyManaged) {
+    const nextTransition = Number(value.transitionId);
+    if (!Number.isSafeInteger(nextTransition) || nextTransition <= transitionId) return;
+    transitionId = nextTransition;
+    transitionConfirmed = false;
+    transitionEnded = false;
+    transitionErrored = false;
+  }
   const nextType = value.type === "playlist" ? "playlist" : "video";
   const autoplay = value.autoplay !== false;
   loopEnabled = !!value.loop;
@@ -331,7 +364,7 @@ function loadMedia(value = {}) {
       playlistIndex = Math.min(playlistIndex, playlistIds.length - 1);
       videoId = playlistIds[playlistIndex];
       pendingResumeVideoId = videoId;
-      if (shuffleEnabled) createShuffleOrder(playlistIndex);
+      if (shuffleEnabled && !externallyManaged) createShuffleOrder(playlistIndex);
       else {
         shuffleOrder = [];
         shuffleCursor = -1;
@@ -409,6 +442,7 @@ function recoverPlayback() {
 }
 
 function executeCommand(message) {
+  if (bridgeSession && (message.protocolVersion !== BRIDGE_VERSION || message.session !== bridgeSession)) return;
   if (!playerReady || !player) {
     pendingCommands.push(message);
     return;
@@ -434,11 +468,13 @@ function executeCommand(message) {
       else player.pauseVideo?.();
       break;
     case "next":
+      if (externallyManaged) { postBridgeEvent("navigationRequested", { direction: 1 }); break; }
       playbackIntent = true;
       if (managedPlaylist) navigateManaged(1, "manual");
       else player.nextVideo?.();
       break;
     case "previous":
+      if (externallyManaged) { postBridgeEvent("navigationRequested", { direction: -1 }); break; }
       playbackIntent = true;
       if (managedPlaylist) navigateManaged(-1, "manual");
       else player.previousVideo?.();
@@ -472,6 +508,7 @@ function executeCommand(message) {
       const nextShuffle = !!value;
       if (shuffleEnabled === nextShuffle) break;
       shuffleEnabled = nextShuffle;
+      if (externallyManaged) break;
       if (managedPlaylist) {
         if (shuffleEnabled) {
           createShuffleOrder(playlistIndex);
@@ -554,7 +591,7 @@ function buildPlayerConfig(generation, restore) {
       },
     },
   };
-  if (videoId) config.videoId = videoId;
+  if (videoId && (!bridgeSession || transitionId > 0 || restore)) config.videoId = videoId;
   else if (window.parent === window && mediaType === "playlist" && playlistId && !managedPlaylist) {
     config.playerVars.listType = "playlist";
     config.playerVars.list = playlistId;
@@ -622,6 +659,11 @@ function onPlayerStateChange(event, generation) {
   if (generation !== playerGeneration || event.target !== player) return;
   const state = Number(event.data);
   const currentId = getCurrentVideoId();
+  if (externallyManaged) {
+    if (transitionEnded || transitionErrored || !currentId || currentId !== videoId) return;
+    if (state === 1) transitionConfirmed = true;
+    if (state === 0 && (!transitionConfirmed || !isNearEnd())) return;
+  }
   if (currentId && (!managedPlaylist || !videoId || currentId === videoId)) {
     videoId = currentId;
     if (managedPlaylist) {
@@ -655,6 +697,14 @@ function onPlayerStateChange(event, generation) {
 function onPlayerError(event, generation) {
   if (generation !== playerGeneration || event.target !== player) return;
   clearEndedTimer();
+  if (externallyManaged) {
+    if (transitionErrored || transitionEnded) return;
+    // Ignore errors explicitly attributed to the previous video during a load.
+    const loaded = getCurrentVideoId();
+    if (loaded && loaded !== videoId) return;
+    transitionErrored = true;
+    playbackIntent = false;
+  }
   postBridgeEvent("error", { ...getSnapshot(), code: Number(event.data) || 0 });
 }
 
@@ -721,6 +771,11 @@ window.setInterval(() => {
   if (heartbeatSignature !== lastHeartbeatSignature) {
     lastHeartbeatSignature = heartbeatSignature;
     publishState("snapshot");
+  }
+  if (externallyManaged) {
+    if (state === 1 && getCurrentVideoId() === videoId && !transitionEnded && !transitionErrored) transitionConfirmed = true;
+    if (playbackIntent && state === 0 && isNearEnd()) reportControlledEnd();
+    return;
   }
   if (!playbackIntent || document.hidden || state === 1 || state === 3 || awaitingPlaylistData) {
     recoveryStartedAt = 0;
